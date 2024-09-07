@@ -1,15 +1,17 @@
-use binary_db::memtable::Memtable;
+use binary_db::binarydb::BinaryDb;
 
 fn main() {
-    let mut memtable = Memtable::new(10_000);
+    let memtable = BinaryDb::new(10_000_000, 100);
 
-    println!("{:?}", memtable.get("key2"));
-    println!("{:?}", memtable.search_columns("value2"));
+    //println!("{:?}", memtable.search_columns("value2"));
 
     // Insert rows with multiple columns
-    //for i in 0..10_000 {
-    //    memtable.insert(format!("key{}", i), vec!["value1".to_string(), "value2".to_string()]);
-    //}
+    // for i in 0..10_000_000 {
+    //     memtable.insert(format!("key{}", i), vec!["value1".to_string(), "value2".to_string()]);
+    // }
+
+    //println!("{:?}", memtable.search_columns("value2"));
+    println!("{:?}", memtable.get("key190000"));
 
     // Flush the memtable to disk
     //memtable.flush_to_disk();
