@@ -1,5 +1,5 @@
 use std::arch::x86_64::*;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::convert::TryInto;
 use std::fs::File;
 use std::io::{BufWriter, Write, BufReader, Read};
