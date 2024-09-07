@@ -1,8 +1,8 @@
-use std::arch::x86_64::*;
 use std::collections::HashMap;
 use std::convert::TryInto;
 use std::fs::File;
 use std::io::{BufWriter, Write, BufReader, Read};
+use std::num::NonZero;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use lru::LruCache;
@@ -10,10 +10,12 @@ use lz4::EncoderBuilder;
 use lz4::Decoder;
 use rayon::prelude::*;
 
+use super::simd::*;
+
 #[derive(Debug, Clone)]
 pub struct Row {
     pub key: String,
-    pub columns: Vec<String>,
+    pub columns: Vec<Value>,
 }
 
 impl Row {
@@ -23,22 +25,39 @@ impl Row {
         // Serialize key
         let key_len = self.key.len() as u32;
         bytes.extend_from_slice(&key_len.to_le_bytes());
+        bytes.extend(simd_memcpy(self.key.as_bytes()));  // SIMD for key
 
-        let key_bytes = self.key.as_bytes();
-        // Use SIMD for memory copying
-        bytes.extend(simd_memcpy(key_bytes));  // Optimized memcpy for key
-
-        // Serialize each column
+        // Serialize columns (now using Value enum)
         let col_count = self.columns.len() as u32;
         bytes.extend_from_slice(&col_count.to_le_bytes());
 
         for col in &self.columns {
-            let col_len = col.len() as u32;
-            bytes.extend_from_slice(&col_len.to_le_bytes());
-
-            let col_bytes = col.as_bytes();
-            // Use SIMD for memory copying
-            bytes.extend(simd_memcpy(col_bytes));  // Optimized memcpy for columns
+            match col {
+                Value::Int(i) => {
+                    bytes.push(0); // Type marker for Int
+                    bytes.extend_from_slice(&i.to_le_bytes());
+                }
+                Value::Bool(b) => {
+                    bytes.push(1); // Type marker for Bool
+                    bytes.push(*b as u8);
+                }
+                Value::Str(s) => {
+                    bytes.push(2); // Type marker for String
+                    let len = s.len() as u32;
+                    bytes.extend_from_slice(&len.to_le_bytes());
+                    bytes.extend(simd_memcpy(s.as_bytes()));  // SIMD for string data
+                }
+                Value::Float(f) => {
+                    bytes.push(3); // Type marker for Float
+                    bytes.extend_from_slice(&f.to_le_bytes());
+                }
+                Value::Binary(bin) => {
+                    bytes.push(4); // Type marker for Binary data
+                    let len = bin.len() as u32;
+                    bytes.extend_from_slice(&len.to_le_bytes());
+                    bytes.extend_from_slice(bin);  // Raw binary data
+                }
+            }
         }
 
         bytes
@@ -50,7 +69,7 @@ impl Row {
         // Deserialize key
         let key_len = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
         cursor += 4;
-        let key = simd_from_utf8(&bytes[cursor..cursor + key_len]); // Use SIMD here for string conversion
+        let key = simd_from_utf8(&bytes[cursor..cursor + key_len]); // SIMD string conversion
         cursor += key_len;
 
         // Deserialize columns
@@ -59,14 +78,46 @@ impl Row {
         let mut columns = Vec::with_capacity(col_count);
 
         for _ in 0..col_count {
-            let col_len = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
-            cursor += 4;
-            let col = simd_from_utf8(&bytes[cursor..cursor + col_len]); // Use SIMD here for string conversion
-            cursor += col_len;
-            columns.push(col);
+            let value_type = bytes[cursor];
+            cursor += 1;
+
+            let value = match value_type {
+                0 => {  // Int
+                    let int_value = i64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+                    cursor += 8;
+                    Value::Int(int_value)
+                }
+                1 => {  // Bool
+                    let bool_value = bytes[cursor] != 0;
+                    cursor += 1;
+                    Value::Bool(bool_value)
+                }
+                2 => {  // String
+                    let str_len = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+                    cursor += 4;
+                    let str_value = simd_from_utf8(&bytes[cursor..cursor + str_len]); // SIMD string conversion
+                    cursor += str_len;
+                    Value::Str(str_value)
+                }
+                3 => {  // Float
+                    let float_value = f64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+                    cursor += 8;
+                    Value::Float(float_value)
+                }
+                4 => {  // Binary
+                    let bin_len = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
+                    cursor += 4;
+                    let bin_value = bytes[cursor..cursor + bin_len].to_vec();
+                    cursor += bin_len;
+                    Value::Binary(bin_value)
+                }
+                _ => panic!("Unknown column type"),
+            };
+
+            columns.push(value);
         }
 
-        (Row { key, columns }, cursor) // Return the row and the number of bytes read
+        (Row { key, columns }, cursor)
     }
 }
 
@@ -75,22 +126,22 @@ pub struct BinaryDb {
     cache: Arc<Mutex<LruCache<String, Row>>>,  // LRU cache for recently accessed data
     size_limit: usize,                 // Max entries before flushing
     sstable_count: u32,                // Counter for SSTables
-    cache_size: usize, 
+    _cache_size: usize, 
 }
 
 impl BinaryDb {
     pub fn new(size_limit: usize, cache_size: usize) -> Self {
         Self {
             map: HashMap::new(),
-            cache: Arc::new(Mutex::new(LruCache::new(cache_size))),
+            cache: Arc::new(Mutex::new(LruCache::new(NonZero::new(cache_size).unwrap()))),
             size_limit,
             sstable_count: 0,
-            cache_size,
+            _cache_size: cache_size,
         }
     }
 
     // Insert a row into the in-memory map, with disk flush when limit is exceeded
-    pub fn insert(&mut self, key: String, columns: Vec<String>) {
+    pub fn insert(&mut self, key: String, columns: Vec<Value>) {
         let row = Row { key: key.clone(), columns };
     
         // Step 1: Insert the row into the in-memory BTreeMap
@@ -149,6 +200,9 @@ impl BinaryDb {
         // Step 4: Clear temporary buffers using SIMD zeroing for efficient memory reset
         let mut buffer = vec![0u8; 64 * 1024]; // Example buffer size
         simd_zero_memory(&mut buffer); // Zero out the buffer using SIMD
+
+        // Check if compaction is needed after creating a new SSTable
+        self.check_and_compact_sstables();
     }
 
     // Optimized `get` method: Search in-memory, cache, and then disk
@@ -233,51 +287,51 @@ impl BinaryDb {
         None
     }
 
-    pub fn search_columns(&self, target: &str) -> Vec<Row> {
+    pub fn search_columns(&self, target: &Value) -> Vec<Row> {
         let mut result = Vec::new();
-
-        // Step 1: Search in memory (parallel search of columns)
+    
+        // Search in-memory (parallel search of columns)
         let mut memory_results: Vec<Row> = self.map
             .values()
             .par_bridge() // Convert standard iterator to a parallel iterator
-            .filter(|row| self.row_has_matching_column(row, target.as_bytes()))
+            .filter(|row| self.row_has_matching_column(row, target))
             .cloned()
             .collect();
-        
+    
         result.append(&mut memory_results);
-
-        // Step 2: Search in SSTable files in parallel
+    
+        // Search in SSTable files in parallel
         let sstable_files = self.get_sstable_files();
         let mut sstable_results: Vec<Row> = sstable_files
             .into_par_iter() // Use Rayon to parallelize file search
             .flat_map(|file| self.search_columns_in_sstable_file(&file, target))
             .collect();
-
+    
         result.append(&mut sstable_results);
-
+    
         result // Return all found rows where columns match
     }
 
     // Search for columns in a given SSTable file that match the target string
-    fn search_columns_in_sstable_file(&self, filename: &str, target: &str) -> Vec<Row> {
-        let rows = self.read_sstable(filename);
-        let target_bytes = target.as_bytes(); // Convert target string to bytes for comparison
-    
+   fn search_columns_in_sstable_file(&self, filename: &str, target: &Value) -> Vec<Row> {
+        let rows = self.read_sstable(filename);  // Read the SSTable from disk
+
+        // Parallelize the search using Rayon, filtering rows where any column matches the target value
         rows.into_par_iter()
             .filter(|row| {
                 row.columns.iter().any(|col| {
-                    // Use SIMD to compare column data
-                    simd_compare_keys(&simd_from_utf8(col.as_bytes()), target_bytes)
+                    // Compare each column's value with the target value
+                    simd_compare_values(col, target)
                 })
             })
             .collect()
     }
 
     // Helper method to check if any column in a row matches the target string
-    fn row_has_matching_column(&self, row: &Row, target_bytes: &[u8]) -> bool {
+    fn row_has_matching_column(&self, row: &Row, target: &Value) -> bool {
         row.columns
             .iter()
-            .any(|col| simd_compare_keys(col, target_bytes)) // SIMD-enhanced string comparison
+            .any(|col| simd_compare_values(col, target))
     }
 
     pub fn read_sstable(&self, filename: &str) -> Vec<Row> {
@@ -330,89 +384,66 @@ impl BinaryDb {
     
         rows
     }
-}
 
-fn simd_memcpy(src: &[u8]) -> Vec<u8> {
-    let mut dst = vec![0u8; src.len()];
-    let mut i = 0;
+    // Trigger compaction based on the number of SSTables
+    pub fn check_and_compact_sstables(&mut self) {
+        let sstable_files = self.get_sstable_files();
+        let threshold = 5;  // Example threshold for when to trigger compaction
 
-    // Copy 16 bytes (128 bits) at a time with SIMD
-    while i + 16 <= src.len() {
-        unsafe {
-            let data = _mm_loadu_si128(src.as_ptr().add(i) as *const __m128i);
-            _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, data);
+        // Trigger compaction if we exceed the threshold number of SSTables
+        if sstable_files.len() > threshold {
+            self.compact_sstables(&sstable_files);
         }
-        i += 16;
     }
 
-    // Copy remaining bytes
-    dst[i..].copy_from_slice(&src[i..]);
-    dst
-}
+    // Compacts the given SSTables into a single SSTable
+    fn compact_sstables(&mut self, sstable_files: &[String]) {
+        let mut all_rows = HashMap::new();  // Temporary storage for merged rows
 
-fn simd_from_utf8(bytes: &[u8]) -> String {
-    let mut dst = vec![0u8; bytes.len()];
-    let mut i = 0;
+        // Step 1: Read and merge all rows from the SSTable files
+        for file in sstable_files {
+            let rows = self.read_sstable(file);
 
-    // Copy 16 bytes (128 bits) at a time with SIMD
-    while i + 16 <= bytes.len() {
-        unsafe {
-            let data = _mm_loadu_si128(bytes.as_ptr().add(i) as *const __m128i);
-            _mm_storeu_si128(dst.as_mut_ptr().add(i) as *mut __m128i, data);
-        }
-        i += 16;
-    }
-
-    // Copy remaining bytes
-    dst[i..].copy_from_slice(&bytes[i..]);
-
-    String::from_utf8(dst).unwrap()
-}
-
-// SIMD-optimized key comparison (for string equality)
-fn simd_compare_keys(key: &str, target: &[u8]) -> bool {
-    let key_bytes = key.as_bytes();
-
-    if key_bytes.len() != target.len() {
-        return false;
-    }
-
-    let len = key_bytes.len();
-    let mut i = 0;
-
-    // Compare 16 bytes (128 bits) at a time using SIMD
-    while i + 16 <= len {
-        unsafe {
-            let key_chunk = _mm_loadu_si128(key_bytes.as_ptr().add(i) as *const __m128i);
-            let target_chunk = _mm_loadu_si128(target.as_ptr().add(i) as *const __m128i);
-            let cmp = _mm_cmpeq_epi8(key_chunk, target_chunk);
-
-            if _mm_movemask_epi8(cmp) != 0xFFFF {
-                return false;
+            for row in rows {
+                let key = row.key.clone();
+                // Insert the row into the map, overwriting older entries with the same key
+                all_rows.insert(key, row);
             }
         }
-        i += 16;
-    }
 
-    // Compare remaining bytes
-    key_bytes[i..] == target[i..]
+        // Step 2: Write the merged rows into a new SSTable
+        let new_filename = format!("sstable_{}.bin", self.sstable_count);
+        self.sstable_count += 1;
+
+        let path = Path::new(&new_filename);
+        let file = File::create(&path).expect("Failed to create new SSTable file");
+
+        let writer = BufWriter::with_capacity(64 * 1024, file);  // 64 KB buffer
+        let mut encoder = EncoderBuilder::new().build(writer).unwrap();
+
+        // Write all merged rows to the new SSTable
+        for row in all_rows.values() {
+            let row_bytes = row.to_bytes();
+            encoder.write_all(&row_bytes).expect("Failed to write row during compaction");
+        }
+
+        // Finish writing and close the file
+        encoder.finish().1.expect("Failed to finalize compacted SSTable");
+
+        // Step 3: Delete the old SSTable files
+        for file in sstable_files {
+            std::fs::remove_file(file).expect("Failed to delete old SSTable during compaction");
+        }
+
+        println!("Compaction completed, {} SSTables merged into {}", sstable_files.len(), new_filename);
+    }
 }
 
-fn simd_zero_memory(buffer: &mut [u8]) {
-    let mut i = 0;
-    let len = buffer.len();
-
-    // Zero 16 bytes at a time using SIMD
-    while i + 16 <= len {
-        unsafe {
-            let zero = _mm_setzero_si128(); // Create a 128-bit zero value
-            _mm_storeu_si128(buffer.as_mut_ptr().add(i) as *mut __m128i, zero);
-        }
-        i += 16;
-    }
-
-    // Zero any remaining bytes
-    for b in buffer.iter_mut().skip(i) {
-        *b = 0;
-    }
+#[derive(Debug, Clone)]
+pub enum Value {
+    Int(i64),
+    Bool(bool),
+    Str(String),
+    Float(f64),
+    Binary(Vec<u8>),
 }

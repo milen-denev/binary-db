@@ -1,17 +1,49 @@
-use binary_db::binarydb::BinaryDb;
+use std::time::Duration;
+
+use binary_db::binarydb::{BinaryDb, Value};
 
 fn main() {
-    let binary_db = BinaryDb::new(10_000_000, 100);
+    let mut binary_db = BinaryDb::new(1000, 100);
 
     //println!("{:?}", binary_db.search_columns("value2"));
 
     // Insert rows with multiple columns
-    // for i in 0..10_000_000 {
-    //     binary_db.insert(format!("key{}", i), vec!["value1".to_string(), "value2".to_string()]);
+    // for i in 20_000..40_000 {
+    //     binary_db.insert(format!("key{}", i), 
+    //     vec![
+    //         Value::Str(format!("value{}", i)),
+    //         Value::Str(format!("value{}", 10_000_000 + i)),
+    //         Value::Float(15.0),
+    //         Value::Int(300),
+    //         Value::Bool(false),
+    //         Value::Bool(true),
+    //         ]);
     // }
 
     //println!("{:?}", memtable.search_columns("value2"));
-    println!("{:?}", binary_db.get("key190000"));
+
+    let mut stopwatch = stopwatch::Stopwatch::new();
+
+    stopwatch.start();
+    println!("{:?}", binary_db.get("key25000"));
+    stopwatch.stop();
+
+    println!("{}", stopwatch.elapsed_ms());
+    stopwatch.reset();
+
+    stopwatch.start();
+    println!("{:?}", binary_db.get("key25001"));
+    stopwatch.stop();
+    
+    println!("{}", stopwatch.elapsed_ms());
+    stopwatch.reset();
+
+    stopwatch.start();
+    println!("{:?}", binary_db.get("key35001"));
+    stopwatch.stop();
+    
+    println!("{}", stopwatch.elapsed_ms());
+    stopwatch.reset();
 
     // Flush the binary_db to disk
     //binary_db.flush_to_disk();
@@ -26,4 +58,6 @@ fn main() {
     //for row in rows {
     //    println!("Found row in SSTable: key = {}, columns = {:?}", row.key, row.columns);
     //}
+
+    std::thread::sleep(Duration::from_secs(10000));
 }

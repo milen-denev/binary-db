@@ -6,4 +6,5 @@ edition = "2021"
 [dependencies]
 lz4 = "1.26.0"
 rayon = "1.10.0"
-lru = "0.7"
+lru = "0.12.4"
+stopwatch = "0.0.7"
