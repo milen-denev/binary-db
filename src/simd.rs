@@ -1,6 +1,6 @@
 use std::arch::x86_64::*;
 
-use crate::binarydb::Value;
+use crate::value::Value;
 
 pub fn simd_memcpy(src: &[u8]) -> Vec<u8> {
     let mut dst = vec![0u8; src.len()];

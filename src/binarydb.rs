@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::convert::TryInto;
 use std::fs::File;
 use std::io::{BufWriter, Write, BufReader, Read};
 use std::num::NonZero;
@@ -10,123 +9,17 @@ use lz4::EncoderBuilder;
 use lz4::Decoder;
 use rayon::prelude::*;
 
+use crate::key::Key;
+use crate::row::Row;
+use crate::value::Value;
+
 use super::simd::*;
 
-#[derive(Debug, Clone)]
-pub struct Row {
-    pub key: String,
-    pub columns: Vec<Value>,
-}
-
-impl Row {
-    pub fn to_bytes(&self) -> Vec<u8> {
-        let mut bytes = vec![];
-
-        // Serialize key
-        let key_len = self.key.len() as u32;
-        bytes.extend_from_slice(&key_len.to_le_bytes());
-        bytes.extend(simd_memcpy(self.key.as_bytes()));  // SIMD for key
-
-        // Serialize columns (now using Value enum)
-        let col_count = self.columns.len() as u32;
-        bytes.extend_from_slice(&col_count.to_le_bytes());
-
-        for col in &self.columns {
-            match col {
-                Value::Int(i) => {
-                    bytes.push(0); // Type marker for Int
-                    bytes.extend_from_slice(&i.to_le_bytes());
-                }
-                Value::Bool(b) => {
-                    bytes.push(1); // Type marker for Bool
-                    bytes.push(*b as u8);
-                }
-                Value::Str(s) => {
-                    bytes.push(2); // Type marker for String
-                    let len = s.len() as u32;
-                    bytes.extend_from_slice(&len.to_le_bytes());
-                    bytes.extend(simd_memcpy(s.as_bytes()));  // SIMD for string data
-                }
-                Value::Float(f) => {
-                    bytes.push(3); // Type marker for Float
-                    bytes.extend_from_slice(&f.to_le_bytes());
-                }
-                Value::Binary(bin) => {
-                    bytes.push(4); // Type marker for Binary data
-                    let len = bin.len() as u32;
-                    bytes.extend_from_slice(&len.to_le_bytes());
-                    bytes.extend_from_slice(bin);  // Raw binary data
-                }
-            }
-        }
-
-        bytes
-    }
-
-    pub fn from_bytes(bytes: &[u8]) -> (Self, usize) {
-        let mut cursor = 0;
-
-        // Deserialize key
-        let key_len = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
-        cursor += 4;
-        let key = simd_from_utf8(&bytes[cursor..cursor + key_len]); // SIMD string conversion
-        cursor += key_len;
-
-        // Deserialize columns
-        let col_count = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
-        cursor += 4;
-        let mut columns = Vec::with_capacity(col_count);
-
-        for _ in 0..col_count {
-            let value_type = bytes[cursor];
-            cursor += 1;
-
-            let value = match value_type {
-                0 => {  // Int
-                    let int_value = i64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
-                    cursor += 8;
-                    Value::Int(int_value)
-                }
-                1 => {  // Bool
-                    let bool_value = bytes[cursor] != 0;
-                    cursor += 1;
-                    Value::Bool(bool_value)
-                }
-                2 => {  // String
-                    let str_len = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
-                    cursor += 4;
-                    let str_value = simd_from_utf8(&bytes[cursor..cursor + str_len]); // SIMD string conversion
-                    cursor += str_len;
-                    Value::Str(str_value)
-                }
-                3 => {  // Float
-                    let float_value = f64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
-                    cursor += 8;
-                    Value::Float(float_value)
-                }
-                4 => {  // Binary
-                    let bin_len = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
-                    cursor += 4;
-                    let bin_value = bytes[cursor..cursor + bin_len].to_vec();
-                    cursor += bin_len;
-                    Value::Binary(bin_value)
-                }
-                _ => panic!("Unknown column type"),
-            };
-
-            columns.push(value);
-        }
-
-        (Row { key, columns }, cursor)
-    }
-}
-
 pub struct BinaryDb {
-    map: HashMap<String, Row>,
-    cache: Arc<Mutex<LruCache<String, Row>>>,  // LRU cache for recently accessed data
+    map: HashMap<Key, Row>,
+    cache: Arc<Mutex<LruCache<Key, Row>>>,  // LRU cache for recently accessed data
     size_limit: usize,                 // Max entries before flushing
     sstable_count: u32,                // Counter for SSTables
-    _cache_size: usize, 
 }
 
 impl BinaryDb {
@@ -135,13 +28,12 @@ impl BinaryDb {
             map: HashMap::new(),
             cache: Arc::new(Mutex::new(LruCache::new(NonZero::new(cache_size).unwrap()))),
             size_limit,
-            sstable_count: 0,
-            _cache_size: cache_size,
+            sstable_count: 0
         }
     }
 
     // Insert a row into the in-memory map, with disk flush when limit is exceeded
-    pub fn insert(&mut self, key: String, columns: Vec<Value>) {
+    pub fn insert(&mut self, key: Key, columns: Vec<Value>) {
         let row = Row { key: key.clone(), columns };
     
         // Step 1: Insert the row into the in-memory BTreeMap
@@ -206,8 +98,8 @@ impl BinaryDb {
     }
 
     // Optimized `get` method: Search in-memory, cache, and then disk
-    pub fn get(&self, key: &str) -> Option<Row> {
-        // Step 1: Search in-memory (hot data in BTreeMap)
+    pub fn get(&self, key: &Key) -> Option<Row> {
+        // Step 1: Search in-memory (hot data in the HashMap)
         if let Some(row) = self.map.get(key) {
             return Some(row.clone());
         }
@@ -223,11 +115,12 @@ impl BinaryDb {
         for file in sstable_files {
             if let Some(row) = self.load_row_from_sstable(&file, key) {
                 // Step 4: Store loaded row into LRU cache
-                cache.put(key.to_string(), row.clone());
+                cache.put(key.clone(), row.clone());
                 return Some(row);
             }
         }
-    
+
+        // Step 5: Return None if not found
         None
     }
     
@@ -255,15 +148,15 @@ impl BinaryDb {
             .collect()
     }
 
-    // Method to load a single row from the SSTable file on disk
-    fn load_row_from_sstable(&self, filename: &str, key: &str) -> Option<Row> {
+    // Method to load a single row from the SSTable file on disk based on the key
+    fn load_row_from_sstable(&self, filename: &str, key: &Key) -> Option<Row> {
         let path = std::path::Path::new(filename);
         let file = std::fs::File::open(&path).ok()?;
         let reader = std::io::BufReader::new(file);
         let mut buffer = [0u8; 64 * 1024]; // 64 KB buffer
         let mut decompressed_data = Vec::new();
     
-        // Read and decompress the SSTable file in chunks
+        // Step 1: Read and decompress the SSTable file in chunks
         let mut decoder = lz4::Decoder::new(reader).ok()?;
         loop {
             let n = decoder.read(&mut buffer).ok()?;
@@ -273,18 +166,19 @@ impl BinaryDb {
             decompressed_data.extend_from_slice(&buffer[..n]);
         }
     
-        // Deserialize the rows and search for the matching key
+        // Step 2: Deserialize rows and search for the matching key
         let mut cursor = 0;
         while cursor < decompressed_data.len() {
             let (row, bytes_read) = Row::from_bytes(&decompressed_data[cursor..]);
             cursor += bytes_read;
-    
-            if row.key == key {
-                return Some(row); // Return the row if key matches
+
+            // Step 3: Compare the deserialized row's key with the provided key
+            if row.key == *key {
+                return Some(row); // Return the matching row
             }
         }
     
-        None
+        None // Return None if no matching key is found
     }
 
     pub fn search_columns(&self, target: &Value) -> Vec<Row> {
@@ -437,13 +331,4 @@ impl BinaryDb {
 
         println!("Compaction completed, {} SSTables merged into {}", sstable_files.len(), new_filename);
     }
-}
-
-#[derive(Debug, Clone)]
-pub enum Value {
-    Int(i64),
-    Bool(bool),
-    Str(String),
-    Float(f64),
-    Binary(Vec<u8>),
 }

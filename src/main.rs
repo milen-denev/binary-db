@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use binary_db::binarydb::{BinaryDb, Value};
+use binary_db::{binarydb::BinaryDb, key::Key, value::Value};
 
 fn main() {
     let mut binary_db = BinaryDb::new(1000, 100);
@@ -8,8 +8,8 @@ fn main() {
     //println!("{:?}", binary_db.search_columns("value2"));
 
     // Insert rows with multiple columns
-    // for i in 20_000..40_000 {
-    //     binary_db.insert(format!("key{}", i), 
+    // for i in 0..40_000 {
+    //     binary_db.insert(Key::Str(format!("key{}", i)), 
     //     vec![
     //         Value::Str(format!("value{}", i)),
     //         Value::Str(format!("value{}", 10_000_000 + i)),
@@ -25,21 +25,21 @@ fn main() {
     let mut stopwatch = stopwatch::Stopwatch::new();
 
     stopwatch.start();
-    println!("{:?}", binary_db.get("key25000"));
+    println!("{:?}", binary_db.get(&Key::Str("key25000".to_string())));
     stopwatch.stop();
 
     println!("{}", stopwatch.elapsed_ms());
     stopwatch.reset();
 
     stopwatch.start();
-    println!("{:?}", binary_db.get("key25001"));
+    println!("{:?}", binary_db.get(&Key::Str("key30000".to_string())));
     stopwatch.stop();
     
     println!("{}", stopwatch.elapsed_ms());
     stopwatch.reset();
 
     stopwatch.start();
-    println!("{:?}", binary_db.get("key35001"));
+    println!("{:?}", binary_db.get(&Key::Str("key35000".to_string())));
     stopwatch.stop();
     
     println!("{}", stopwatch.elapsed_ms());
