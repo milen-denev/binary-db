@@ -4,6 +4,7 @@ use std::io::{BufWriter, Write, BufReader, Read};
 use std::num::NonZero;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
+use dashmap::DashMap;
 use lru::LruCache;
 use lz4::EncoderBuilder;
 use lz4::Decoder;
@@ -16,7 +17,7 @@ use crate::value::Value;
 use super::simd::*;
 
 pub struct BinaryDb {
-    map: HashMap<Key, Row>,
+    map: Arc<DashMap<Key, Row>>,
     cache: Arc<Mutex<LruCache<Key, Row>>>,  // LRU cache for recently accessed data
     size_limit: usize,                 // Max entries before flushing
     sstable_count: u32,                // Counter for SSTables
@@ -25,7 +26,7 @@ pub struct BinaryDb {
 impl BinaryDb {
     pub fn new(size_limit: usize, cache_size: usize) -> Self {
         Self {
-            map: HashMap::new(),
+            map: Arc::new(DashMap::new()),
             cache: Arc::new(Mutex::new(LruCache::new(NonZero::new(cache_size).unwrap()))),
             size_limit,
             sstable_count: 0
@@ -73,9 +74,8 @@ impl BinaryDb {
         let mut encoder = EncoderBuilder::new().build(writer).unwrap();
     
         // Step 1: Write all rows from the in-memory map to disk
-        for row in self.map.values() {
-            let row_bytes = row.to_bytes();
-            if let Err(e) = encoder.write_all(&row_bytes) {
+        for row in self.map.iter().map(|x| x.to_bytes()) {
+            if let Err(e) = encoder.write_all(&row) {
                 eprintln!("Failed to write to SSTable file: {}", e);
                 return;
             }
@@ -186,10 +186,10 @@ impl BinaryDb {
     
         // Search in-memory (parallel search of columns)
         let mut memory_results: Vec<Row> = self.map
-            .values()
-            .par_bridge() // Convert standard iterator to a parallel iterator
+            .iter()
+            .par_bridge()
             .filter(|row| self.row_has_matching_column(row, target))
-            .cloned()
+            .map(|x| x.clone())
             .collect();
     
         result.append(&mut memory_results);
