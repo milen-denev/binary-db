@@ -10,3 +10,6 @@ rayon = "1.10.0"
 lru = "0.12.4"
 stopwatch = "0.0.7"
 dashmap =  { version = "=5.5.3", features = ["rayon", "inline"] }
+bincode = "1.3.3"
+serde = { version = "1.0.210", features = ["derive"] }
+bloom = "0.3.1"

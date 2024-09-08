@@ -3,17 +3,17 @@ use std::time::Duration;
 use binary_db::{binarydb::BinaryDb, key::Key, value::Value};
 
 fn main() {
-    let mut binary_db = BinaryDb::new(1000, 100);
+    let mut binary_db = BinaryDb::new(1000, 100, 40000);
 
     //println!("{:?}", binary_db.search_columns("value2"));
 
     // Insert rows with multiple columns
-    // for i in 0..40_000 {
+    // for i in 0..1_000 {
     //     binary_db.insert(Key::Str(format!("key{}", i)), 
     //     vec![
     //         Value::Str(format!("value{}", i)),
     //         Value::Str(format!("value{}", 10_000_000 + i)),
-    //         Value::Float(15.0),
+    //         //Value::Float(15.0),
     //         Value::Int(300),
     //         Value::Bool(false),
     //         Value::Bool(true),

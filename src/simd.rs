@@ -92,7 +92,7 @@ pub fn simd_compare_values(val: &Value, target: &Value) -> bool {
         (Value::Int(a), Value::Int(b)) => a == b,          // Fast int comparison
         (Value::Bool(a), Value::Bool(b)) => a == b,        // Fast bool comparison
         (Value::Str(a), Value::Str(b)) => simd_compare_keys(a, b.as_bytes()),  // SIMD string comparison
-        (Value::Float(a), Value::Float(b)) => a == b,      // Fast float comparison
+        //(Value::Float(a), Value::Float(b)) => a == b,      // Fast float comparison
         (Value::Binary(a), Value::Binary(b)) => a == b,    // Raw binary comparison
         _ => false,                                        // Different types can't be compared
     }

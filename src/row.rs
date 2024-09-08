@@ -1,7 +1,8 @@
+use serde::{Deserialize, Serialize};
+
 use crate::{key::Key, simd::{simd_from_utf8, simd_memcpy}, value::Value};
 
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Deserialize, Serialize, PartialOrd, Ord)]
 pub struct Row {
     pub key: Key,
     pub columns: Vec<Value>,
@@ -45,10 +46,10 @@ impl Row {
                     bytes.extend_from_slice(&len.to_le_bytes());
                     bytes.extend(simd_memcpy(s.as_bytes()));  // Using SIMD for string column data
                 }
-                Value::Float(f) => {
-                    bytes.push(3); // Type marker for Float
-                    bytes.extend_from_slice(&f.to_le_bytes());
-                }
+                // Value::Float(f) => {
+                //     bytes.push(3); // Type marker for Float
+                //     bytes.extend_from_slice(&f.to_le_bytes());
+                // }
                 Value::Binary(bin) => {
                     bytes.push(4); // Type marker for Binary data
                     let len = bin.len() as u32;
@@ -111,11 +112,11 @@ impl Row {
                     cursor += str_len;
                     Value::Str(str_value)
                 }
-                3 => {  // Float
-                    let float_value = f64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
-                    cursor += 8;
-                    Value::Float(float_value)
-                }
+                // 3 => {  // Float
+                //     let float_value = f64::from_le_bytes(bytes[cursor..cursor + 8].try_into().unwrap());
+                //     cursor += 8;
+                //     Value::Float(float_value)
+                // }
                 4 => {  // Binary
                     let bin_len = u32::from_le_bytes(bytes[cursor..cursor + 4].try_into().unwrap()) as usize;
                     cursor += 4;

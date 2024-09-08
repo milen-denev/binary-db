@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::{BufWriter, Write, BufReader, Read};
 use std::num::NonZero;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
+use bloom::{BloomFilter, ASMS};
 use dashmap::DashMap;
 use lru::LruCache;
 use lz4::EncoderBuilder;
@@ -18,40 +19,129 @@ use super::simd::*;
 
 pub struct BinaryDb {
     map: Arc<DashMap<Key, Row>>,
-    cache: Arc<Mutex<LruCache<Key, Row>>>,  // LRU cache for recently accessed data
-    size_limit: usize,                 // Max entries before flushing
-    sstable_count: u32,                // Counter for SSTables
+    cache: Arc<Mutex<LruCache<Key, Row>>>,  
+    size_limit: usize,                      
+    sstable_count: u32,                     
+    key_index: Arc<DashMap<Key, usize>>,     
+    column_index: Arc<RwLock<BTreeMap<Value, Vec<Key>>>>, 
+    bloom_filter: BloomFilter, // Add Bloom Filter here
+    index_file_path: String,
 }
 
 impl BinaryDb {
-    pub fn new(size_limit: usize, cache_size: usize) -> Self {
-        Self {
+    pub fn new(size_limit: usize, cache_size: usize, expected_items: usize) -> Self {
+        let bloom_filter = BloomFilter::with_rate(0.01, expected_items as u32); // 1% false positive rate
+    
+        let mut db = Self {
             map: Arc::new(DashMap::new()),
             cache: Arc::new(Mutex::new(LruCache::new(NonZero::new(cache_size).unwrap()))),
             size_limit,
-            sstable_count: 0
-        }
+            sstable_count: 0,
+            key_index: Arc::new(DashMap::new()),
+            column_index: Arc::new(RwLock::new(BTreeMap::new())),
+            bloom_filter,
+            index_file_path: "persistent_indexes.bin".to_string(),
+        };
+    
+        db.load_indexes_from_disk();
+
+        db
     }
 
     // Insert a row into the in-memory map, with disk flush when limit is exceeded
     pub fn insert(&mut self, key: Key, columns: Vec<Value>) {
-        let row = Row { key: key.clone(), columns };
+        let row = Row { key: key.clone(), columns: columns.clone() };
     
-        // Step 1: Insert the row into the in-memory BTreeMap
+        // Insert the row into the in-memory map
         self.map.insert(key.clone(), row.clone());
     
-        // Step 2: Insert the row into the LRU cache for quick access
+        // Insert into LRU cache
         let mut cache = self.cache.lock().unwrap();
-        cache.put(key.clone(), row);
-    
+        cache.put(key.clone(), row.clone());
         drop(cache);
-
-        // Step 3: Check the size of the in-memory map without borrowing self mutably yet
-        let needs_flush = self.map.len() >= self.size_limit;
     
-        // Step 4: If the in-memory map exceeds size_limit, flush it to disk
-        if needs_flush {
+        // Insert into Bloom filter
+        self.bloom_filter.insert(&key);
+    
+        // Update primary index
+        self.key_index.insert(key.clone(), self.map.len());
+    
+        // Update secondary index using BTreeMap
+        {
+            let mut column_index = self.column_index.write().unwrap();
+            for column_value in columns {
+                column_index
+                    .entry(column_value.clone())
+                    .or_insert_with(Vec::new)
+                    .push(key.clone());
+            }
+        }
+    
+        // Flush to disk if needed
+        if self.map.len() >= self.size_limit {
             self.flush_to_disk();
+        }
+    
+        // Save indexes to disk
+        self.save_indexes_to_disk();
+    }
+
+    // Save indexes to disk (persist them) using MessagePack
+    fn save_indexes_to_disk(&self) {
+        // Step 1: Acquire locks and extract data to serialize
+        let key_index_data: Vec<_> = self.key_index.iter().map(|kv| (kv.key().clone(), *kv.value())).collect();
+        
+        let column_index_data: Vec<_> = {
+            let column_index = self.column_index.read().unwrap();  // Acquire a read lock
+            column_index.iter().map(|(value, keys)| (value.clone(), keys.clone())).collect()
+        };
+    
+        // Step 2: Serialize data
+        let index_data = (key_index_data, column_index_data);
+    
+        // Step 3: Save to disk
+        if let Ok(file) = File::create(&self.index_file_path) {
+            let mut writer = BufWriter::new(file);
+    
+            // Serialize to MessagePack format (or bincode for compact binary format)
+            if bincode::serialize_into(&mut writer, &index_data).is_err() {
+                eprintln!("Failed to serialize indexes to disk");
+            }
+        } else {
+            eprintln!("Failed to create index file");
+        }
+    }
+
+    // Load indexes from disk during initialization using MessagePack
+    fn load_indexes_from_disk(&mut self) {
+        // Step 1: Open the file and deserialize data
+        if let Ok(file) = File::open(&self.index_file_path) {
+            let reader = BufReader::new(file);
+    
+            let index_data: Result<(Vec<(Key, usize)>, Vec<(Value, Vec<Key>)>), _> = 
+                bincode::deserialize_from(reader);
+    
+            // Step 2: If deserialization succeeds, update the in-memory structures
+            if let Ok((key_index_data, column_index_data)) = index_data {
+                // Update key_index
+                for (key, position) in key_index_data {
+                    self.key_index.insert(key, position);
+                }
+    
+                // Update column_index
+                {
+                    let mut column_index = self.column_index.write().unwrap();  // Acquire a write lock
+                    for (value, keys) in column_index_data {
+                        column_index.insert(value, keys);
+                    }
+                }
+    
+                println!("Indexes successfully loaded from disk.");
+            } else {
+                eprintln!("Failed to deserialize indexes from disk.");
+            }
+        } else {
+            eprintln!("Failed to open index file.");
         }
     }
 
@@ -59,7 +149,7 @@ impl BinaryDb {
     pub fn flush_to_disk(&mut self) {
         let filename = format!("sstable_{}.bin", self.sstable_count);
         self.sstable_count += 1;
-    
+
         let path = std::path::Path::new(&filename);
         let file = match std::fs::File::create(&path) {
             Ok(file) => file,
@@ -68,59 +158,62 @@ impl BinaryDb {
                 return;
             }
         };
-    
-        // Use a buffered writer to minimize I/O operations
-        let writer = BufWriter::with_capacity(64 * 1024, file);  // 64 KB buffer
+
+        let writer = BufWriter::with_capacity(64 * 1024, file);
         let mut encoder = EncoderBuilder::new().build(writer).unwrap();
-    
-        // Step 1: Write all rows from the in-memory map to disk
+
         for row in self.map.iter().map(|x| x.to_bytes()) {
             if let Err(e) = encoder.write_all(&row) {
                 eprintln!("Failed to write to SSTable file: {}", e);
                 return;
             }
         }
-    
-        // Step 2: Finish encoding and writing to disk
+
         if let (_, Err(e)) = encoder.finish() {
             eprintln!("Failed to finalize SSTable file: {}", e);
         }
-    
-        // Step 3: Clear the in-memory map to free up memory
-        self.map.clear();
-    
-        // Step 4: Clear temporary buffers using SIMD zeroing for efficient memory reset
-        let mut buffer = vec![0u8; 64 * 1024]; // Example buffer size
-        simd_zero_memory(&mut buffer); // Zero out the buffer using SIMD
 
-        // Check if compaction is needed after creating a new SSTable
+        self.map.clear();
+        self.key_index.clear(); // Clear the in-memory index after flush
+
+        let mut buffer = vec![0u8; 64 * 1024];
+        simd_zero_memory(&mut buffer);
+
         self.check_and_compact_sstables();
+
+        // Save the updated indexes after flushing
+        self.save_indexes_to_disk();
     }
 
     // Optimized `get` method: Search in-memory, cache, and then disk
     pub fn get(&self, key: &Key) -> Option<Row> {
-        // Step 1: Search in-memory (hot data in the HashMap)
-        if let Some(row) = self.map.get(key) {
-            return Some(row.clone());
+        // Step 1: Check Bloom filter first
+        if !self.bloom_filter.contains(key) {
+            return None;  // Key is unlikely to exist
         }
     
-        // Step 2: Search in LRU cache (recently accessed data)
+        // Step 2: Check in-memory map
+        if self.key_index.contains_key(key) {
+            if let Some(row) = self.map.get(key) {
+                return Some(row.clone());
+            }
+        }
+    
+        // Step 3: Check LRU cache
         let mut cache = self.cache.lock().unwrap();
         if let Some(cached_row) = cache.get(key) {
             return Some(cached_row.clone());
         }
     
-        // Step 3: If not found in memory or cache, load from SSTable files
+        // Step 4: Load from SSTable if not found in memory
         let sstable_files = self.get_sstable_files();
         for file in sstable_files {
             if let Some(row) = self.load_row_from_sstable(&file, key) {
-                // Step 4: Store loaded row into LRU cache
                 cache.put(key.clone(), row.clone());
                 return Some(row);
             }
         }
-
-        // Step 5: Return None if not found
+    
         None
     }
     
@@ -184,26 +277,30 @@ impl BinaryDb {
     pub fn search_columns(&self, target: &Value) -> Vec<Row> {
         let mut result = Vec::new();
     
-        // Search in-memory (parallel search of columns)
-        let mut memory_results: Vec<Row> = self.map
-            .iter()
-            .par_bridge()
-            .filter(|row| self.row_has_matching_column(row, target))
-            .map(|x| x.clone())
-            .collect();
+        // Step 1: Check if the value exists in the secondary index (BTreeMap)
+        {
+            let column_index = self.column_index.read().unwrap();
+            if let Some(keys) = column_index.get(target) {
+                for key in keys.iter() {
+                    if let Some(row) = self.get(key) {
+                        result.push(row);
+                    }
+                }
+            }
+        }
     
-        result.append(&mut memory_results);
+        // Step 2: Check SSTables if more results are needed
+        if result.is_empty() {
+            let sstable_files = self.get_sstable_files();
+            let mut sstable_results: Vec<Row> = sstable_files
+                .into_par_iter()
+                .flat_map(|file| self.search_columns_in_sstable_file(&file, target))
+                .collect();
     
-        // Search in SSTable files in parallel
-        let sstable_files = self.get_sstable_files();
-        let mut sstable_results: Vec<Row> = sstable_files
-            .into_par_iter() // Use Rayon to parallelize file search
-            .flat_map(|file| self.search_columns_in_sstable_file(&file, target))
-            .collect();
+            result.append(&mut sstable_results);
+        }
     
-        result.append(&mut sstable_results);
-    
-        result // Return all found rows where columns match
+        result
     }
 
     // Search for columns in a given SSTable file that match the target string
@@ -279,56 +376,53 @@ impl BinaryDb {
         rows
     }
 
-    // Trigger compaction based on the number of SSTables
-    pub fn check_and_compact_sstables(&mut self) {
+     // Trigger compaction and update the persistent index file
+     pub fn check_and_compact_sstables(&mut self) {
         let sstable_files = self.get_sstable_files();
         let threshold = 5;  // Example threshold for when to trigger compaction
 
-        // Trigger compaction if we exceed the threshold number of SSTables
         if sstable_files.len() > threshold {
             self.compact_sstables(&sstable_files);
+            // Save indexes after compaction
+            self.save_indexes_to_disk();
         }
     }
 
-    // Compacts the given SSTables into a single SSTable
+    // Helper function for compacting SSTables
     fn compact_sstables(&mut self, sstable_files: &[String]) {
         let mut all_rows = HashMap::new();  // Temporary storage for merged rows
 
-        // Step 1: Read and merge all rows from the SSTable files
         for file in sstable_files {
             let rows = self.read_sstable(file);
 
             for row in rows {
                 let key = row.key.clone();
-                // Insert the row into the map, overwriting older entries with the same key
                 all_rows.insert(key, row);
             }
         }
 
-        // Step 2: Write the merged rows into a new SSTable
         let new_filename = format!("sstable_{}.bin", self.sstable_count);
         self.sstable_count += 1;
 
         let path = Path::new(&new_filename);
         let file = File::create(&path).expect("Failed to create new SSTable file");
 
-        let writer = BufWriter::with_capacity(64 * 1024, file);  // 64 KB buffer
+        let writer = BufWriter::with_capacity(64 * 1024, file);
         let mut encoder = EncoderBuilder::new().build(writer).unwrap();
 
-        // Write all merged rows to the new SSTable
         for row in all_rows.values() {
             let row_bytes = row.to_bytes();
             encoder.write_all(&row_bytes).expect("Failed to write row during compaction");
         }
 
-        // Finish writing and close the file
         encoder.finish().1.expect("Failed to finalize compacted SSTable");
 
-        // Step 3: Delete the old SSTable files
         for file in sstable_files {
             std::fs::remove_file(file).expect("Failed to delete old SSTable during compaction");
         }
 
-        println!("Compaction completed, {} SSTables merged into {}", sstable_files.len(), new_filename);
+        // Save updated indexes after compaction
+        self.save_indexes_to_disk();
+        println!("Compaction completed, {} SSTables merged.", sstable_files.len());
     }
 }
